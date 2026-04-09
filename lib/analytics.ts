@@ -2,8 +2,7 @@
 // B737 Speedbrake Predictive Maintenance — Analytics engine
 // Optimized: single-pass aggregations, Map-based grouping
 // Updated: Landing distance warning weight reduced,
-//          worst-flight penalty added to health score,
-//          sensor-only warnings separated for insight generation
+//          worst-flight penalty added to health score
 // ============================================================
 import {
   FlightRecord,
@@ -19,6 +18,7 @@ import {
 export function computeTailHealthScores(data: FlightRecord[]): TailHealthScore[] {
   if (data.length === 0) return [];
 
+  // Single pass to group by tail and accumulate stats
   const tailAgg = new Map<string, {
     aircraftType: 'NG' | 'MAX';
     flights: number;
@@ -29,15 +29,16 @@ export function computeTailHealthScores(data: FlightRecord[]): TailHealthScore[]
     l30Sum: number; l30Count: number;
     l50Sum: number; l50Count: number;
     criticalCount: number; warningCount: number;
-    ldOnlyWarningCount: number;
+    ldOnlyWarningCount: number; // warnings caused ONLY by landing distance inversion
     drSum: number; drCount: number;
     ldAnomalyCount: number;
     firstHalfPfd: number[]; secondHalfPfd: number[];
     lastDate: string;
     sortedPfds: number[];
-    worstPfd: number;
+    worstPfd: number; // lowest normalized PFD seen
   }>();
 
+  // First pass — accumulate
   for (let i = 0; i < data.length; i++) {
     const d = data[i];
     let agg = tailAgg.get(d.tailNumber);
@@ -78,8 +79,14 @@ export function computeTailHealthScores(data: FlightRecord[]): TailHealthScore[]
     if (d.anomalyLevel === 'critical') agg.criticalCount++;
     if (d.anomalyLevel === 'warning') {
       agg.warningCount++;
-      // Use the pre-computed anomalySource field
-      if (d.anomalySource === 'sensor') {
+      // Check if this warning is ONLY from landing distance inversion
+      // A warning with score 16-39 where landing distance contributes 30 pts
+      // means without LD the score would be < 16 → not a real speedbrake warning
+      const isLdAnomaly = d.landingDistAnomaly;
+      const hasSpeedbrakeIssue = d.normalizedPfd < 92 ||
+        (d.durationRatio > 3 && d.durationExtTo99 > 4) ||
+        (d.pfdTurn1Deg > 0 && d.pfdTurn1Deg < 25 && d.normalizedPfd < 80);
+      if (isLdAnomaly && !hasSpeedbrakeIssue) {
         agg.ldOnlyWarningCount++;
       }
     }
@@ -101,21 +108,45 @@ export function computeTailHealthScores(data: FlightRecord[]): TailHealthScore[]
     const landingDistAnomalyRate = agg.ldAnomalyCount / Math.max(agg.flights, 1);
     const worstPfd = agg.worstPfd === 999 ? 0 : agg.worstPfd;
 
+    // Separate warning counts
     const realWarningCount = agg.warningCount - agg.ldOnlyWarningCount;
     const ldOnlyWarningCount = agg.ldOnlyWarningCount;
 
+    // ============================================================
+    // Health score 0–100
+    // UPDATED: Landing distance warnings weighted less,
+    //          worst-flight penalty added
+    // ============================================================
     let hs = 100;
+
+    // Average PFD penalty
     if (avgPfd < 95) hs -= (95 - avgPfd) * 1.5;
     if (avgPfd < 80) hs -= (80 - avgPfd) * 2;
+
+    // Critical flights: -5 each
     hs -= agg.criticalCount * 5;
+
+    // Warnings: differentiate by type
+    // Real speedbrake warnings (PFD/angle/duration issues): full weight
     hs -= realWarningCount * 2;
+    // Landing-distance-only warnings (sensor/data quality): reduced weight
     hs -= ldOnlyWarningCount * 0.5;
+
+    // Duration ratio penalty
     if (durationRatioAvg > 2) hs -= (durationRatioAvg - 2) * 5;
+
+    // Landing distance anomaly rate: reduced from 20 to 10
     hs -= landingDistAnomalyRate * 10;
+
+    // Low average angle
     if (avgDeg < 40) hs -= (40 - avgDeg) * 0.5;
+
+    // NEW: Worst single flight penalty
+    // Even one very bad flight is a strong signal of intermittent failure
     if (worstPfd > 0 && worstPfd < 50) hs -= 20;
     else if (worstPfd > 0 && worstPfd < 70) hs -= 10;
     else if (worstPfd > 0 && worstPfd < 80) hs -= 5;
+
     hs = Math.max(0, Math.min(100, hs));
 
     let riskLevel: TailHealthScore['riskLevel'] = 'LOW';
@@ -123,6 +154,7 @@ export function computeTailHealthScores(data: FlightRecord[]): TailHealthScore[]
     else if (hs < 70) riskLevel = 'HIGH';
     else if (hs < 85) riskLevel = 'MEDIUM';
 
+    // Trend from PFD values
     const pfds = agg.sortedPfds;
     const mid = Math.floor(pfds.length / 2) || 1;
     let fp = 0, sp = 0;
@@ -164,7 +196,8 @@ export function computeTailHealthScores(data: FlightRecord[]): TailHealthScore[]
 }
 
 // ----------------------------------------------------------------
-// Predictive insights generation
+// Predictive insights generation — uses pre-computed health scores
+// No per-flight scanning per tail (avoids O(n*tails))
 // ----------------------------------------------------------------
 export function generatePredictiveInsights(
   data: FlightRecord[],
@@ -173,6 +206,7 @@ export function generatePredictiveInsights(
   const insights: PredictiveInsight[] = [];
   let id = 0;
 
+  // Pre-group flights by tail for evidence lookup (lazy - only access when needed)
   let tailFlightsMap: Map<string, FlightRecord[]> | null = null;
   function getTailFlights(tail: string): FlightRecord[] {
     if (!tailFlightsMap) {
@@ -188,6 +222,7 @@ export function generatePredictiveInsights(
   }
 
   for (const h of healthScores) {
+    // Skip healthy tails entirely for performance
     if (h.healthScore > 90 && h.criticalCount === 0 && h.warningCount < 2) continue;
 
     const flights = getTailFlights(h.tailNumber);
@@ -261,23 +296,23 @@ export function generatePredictiveInsights(
       }
     }
 
-    // 4. Landing-distance anomaly — labelled as SENSOR issue
+    // 4. Landing-distance anomaly
     if (h.landingDistAnomalyRate > 0.02) {
       const ldAnom = flights.filter((f) => f.landingDistAnomaly);
       if (ldAnom.length >= 2) {
         insights.push({
           id: `ins-${++id}`,
           tailNumber: h.tailNumber,
-          category: 'sensor',
-          severity: ldAnom.length >= 4 ? 'warning' : 'info',
-          title: `Sensör Uyarısı: İniş Mesafesi Anomalisi [LD] — ${h.tailNumber}`,
-          description: `${ldAnom.length} uçuşta 50kn iniş mesafesi > 30kn iniş mesafesi. Bu fizik kurallarına aykırıdır ve sensör/veri kalitesi sorununa işaret eder. Speedbrake mekanik sorunu DEĞİLDİR.`,
+          category: 'operational',
+          severity: ldAnom.length >= 4 ? 'critical' : 'warning',
+          title: `İniş Mesafesi Anomalisi — ${h.tailNumber}`,
+          description: `${ldAnom.length} uçuşta 50kn iniş mesafesi > 30kn iniş mesafesi. Sensör veya fren sistemi sorunu olabilir.`,
           evidence: ldAnom.slice(0, 5).map(
             (f) =>
-              `${f.flightDate} ${f.takeoffAirport}→${f.landingAirport}: 30kn=${f.landingDist30kn.toFixed(0)}m, 50kn=${f.landingDist50kn.toFixed(0)}m [LD sensör]`,
+              `${f.flightDate} ${f.takeoffAirport}→${f.landingAirport}: 30kn=${f.landingDist30kn.toFixed(0)}m, 50kn=${f.landingDist50kn.toFixed(0)}m`,
           ),
           recommendation:
-            'Wheel speed sensörlerini kalibre edin. Veri aktarım hattını kontrol edin. Bu uyarı speedbrake bakımı gerektirmez.',
+            'Wheel speed sensörlerini kalibre edin. Fren sistemi performansını test edin.',
           relatedFlights: ldAnom.length,
           confidence: Math.min(90, 65 + ldAnom.length * 5),
         });
@@ -289,7 +324,7 @@ export function generatePredictiveInsights(
       insights.push({
         id: `ins-${++id}`,
         tailNumber: h.tailNumber,
-        category: 'mechanical',
+        category: 'sensor',
         severity: h.degradationRate > 10 ? 'critical' : 'warning',
         title: `Performans Degradasyonu — ${h.tailNumber}`,
         description: `Son uçuşlarda PFD değeri ortalama ${h.degradationRate.toFixed(1)} puan düşmüş. Speedbrake performansı kötüleşiyor.`,
@@ -359,7 +394,7 @@ export function analyzeLandingDistances(data: FlightRecord[]): LandingDistanceAn
 }
 
 // ----------------------------------------------------------------
-// Flight timeline entries
+// Flight timeline entries — light transform, no heavy sort needed
 // ----------------------------------------------------------------
 export function buildFlightTimeline(data: FlightRecord[]): FlightTimelineEntry[] {
   const entries: FlightTimelineEntry[] = new Array(data.length);

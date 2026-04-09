@@ -19,8 +19,6 @@ export interface FlightRecord {
   aircraftType: 'NG' | 'MAX';
   anomalyLevel: 'normal' | 'warning' | 'critical';
   anomalyReasons: string[];
-  /** Source tag: which signal(s) drove the anomaly classification */
-  anomalySource: 'speedbrake' | 'sensor' | 'mixed' | 'none';
   // ---- computed helpers ----
   isDoubledRecord: boolean;  // PFD > 150 → probably two panels summed
   normalizedPfd: number;     // doubled records divided back
@@ -34,8 +32,6 @@ export interface AnomalySummary {
   criticalCount: number;
   warningCount: number;
   normalCount: number;
-  /** Sensor-only warnings (landing distance inversion, not speedbrake) */
-  sensorOnlyWarningCount: number;
   uniqueTails: number;
   uniqueNGTails: number;
   uniqueMAXTails: number;

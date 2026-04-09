@@ -1,12 +1,6 @@
 // ============================================================
 // B737 Speedbrake Predictive Maintenance — Utility helpers
 // Revised: Data-driven thresholds using statistical analysis
-//
-// UPDATE: anomalySource field added to every FlightRecord.
-//   'sensor'     → only landing-distance inversion drove the score ≥16
-//   'speedbrake' → real speedbrake parameter(s) drove the score ≥16
-//   'mixed'      → both contributed
-//   'none'       → score <16 (normal)
 // ============================================================
 import {
   FlightRecord,
@@ -46,160 +40,226 @@ export function detectAircraftType(tail: string): 'NG' | 'MAX' {
 }
 
 // ================================================================
-// ANOMALY DETECTION — Multi-signal scoring
+// ANOMALY DETECTION — Revised with data-driven approach
 //
-// Each anomaly signal contributes a weighted score.
-// Signals are only meaningful in combination, not isolation.
+// Problem with old approach:
+//   - Fixed thresholds (PFD<95 = warning) caused massive false positives
+//   - TC-SPB data: 53 flights, 85% are clearly normal but many were
+//     flagged as anomalies due to overly sensitive rules
+//   - Duration ExtTo99 > 5s flagged as warning but some aircraft
+//     routinely show 5-7s with no real issue
+//   - Angle thresholds didn't account for NG vs MAX differences
+//     or single-panel vs dual-panel operation modes
 //
-// Score thresholds:
-//   0-15  : Normal
-//   16-39 : Warning
-//   40+   : Critical
-//
-// Returns { level, reasons, source }
-//   source = 'sensor' | 'speedbrake' | 'mixed' | 'none'
+// New approach — Multi-signal scoring:
+//   1. Each anomaly signal contributes a weighted score (0-100)
+//   2. Signals are only meaningful in combination, not isolation
+//   3. Thresholds are based on actual data distribution:
+//      - TC-SPB normal PFD: 96-100% (median ~99%)
+//      - TC-SPB normal Deg: 33-47° (varies with mode)
+//      - TC-SPB normal Duration: 0.5-4.5s derivative, 0.5-4.5s ext
+//      - Duration ratio normally 0.5-1.5x
+//   4. Only flag as anomaly when MULTIPLE signals agree
+//   5. Distinguish between sensor/data issues vs real mechanical
 // ================================================================
 
 export function detectAnomaly(
-  record: Omit<FlightRecord, 'anomalyLevel' | 'anomalyReasons' | 'anomalySource'>,
-): { level: 'normal' | 'warning' | 'critical'; reasons: string[]; source: 'speedbrake' | 'sensor' | 'mixed' | 'none' } {
+  record: Omit<FlightRecord, 'anomalyLevel' | 'anomalyReasons'>,
+): { level: 'normal' | 'warning' | 'critical'; reasons: string[] } {
   const reasons: string[] = [];
-  let score = 0;
-  let ldScore = 0;      // landing-distance inversion contribution (sensor noise)
-  let sbScore = 0;      // all other (real speedbrake) contribution
+  let score = 0; // Accumulate anomaly evidence score (0 = perfect, 100+ = critical)
   const nPfd = record.normalizedPfd;
 
   // ===========================================
   // Signal 1: PFD deployment percentage
+  // Normal range: 95-101% (100% = full deployment)
+  // Below 75% is genuinely problematic regardless of other signals
+  // 75-85% is concerning, 85-92% is mild
   // ===========================================
   if (nPfd > 0 && nPfd < 60) {
-    sbScore += 60;
+    score += 60;
     reasons.push(`PFD ciddi düşük: ${record.pfdTurn1.toFixed(1)}% — speedbrake neredeyse hiç açılmamış`);
   } else if (nPfd >= 60 && nPfd < 75) {
-    sbScore += 45;
+    score += 45;
     reasons.push(`PFD çok düşük: ${record.pfdTurn1.toFixed(1)}% — tam açılma sağlanamamış`);
   } else if (nPfd >= 75 && nPfd < 85) {
-    sbScore += 25;
+    score += 25;
     reasons.push(`PFD düşük: ${record.pfdTurn1.toFixed(1)}% — kısmi açılma`);
   } else if (nPfd >= 85 && nPfd < 92) {
-    sbScore += 8;
+    // Only mildly suspicious — needs corroboration from other signals
+    score += 8;
     reasons.push(`PFD normalin altında: ${record.pfdTurn1.toFixed(1)}%`);
   }
+  // 92-95% is within normal variation — NOT flagged
+  // 95-100% is perfectly normal
+  // >100% could be doubled record, handled separately
 
   // ===========================================
   // Signal 2: Duration ratio (ExtTo99 / Derivative)
+  // What it means: How much longer does it take to reach 99% vs
+  // the initial derivative-predicted time?
+  //
+  // Normal: 0.5x - 2.0x (derivative and ext are similar)
+  // Suspicious: 3.0x+ (ext takes 3x longer than derivative predicts)
+  // Critical: 5.0x+ (clear hydraulic resistance or mechanical block)
+  //
+  // NOTE: Very small derivative values (0.5-1.5s) can cause
+  // inflated ratios even with moderate ext times. Weight this
+  // signal more when absolute ext time is also high.
   // ===========================================
   if (record.durationDerivative > 0 && record.durationExtTo99 > 0) {
     const ratio = record.durationRatio;
     const absExt = record.durationExtTo99;
+
     if (ratio > 6 && absExt > 8) {
-      sbScore += 40;
+      // Both ratio AND absolute time are extreme → strong signal
+      score += 40;
       reasons.push(`Çok yavaş açılma: %99'a ${absExt.toFixed(1)}s (oran ${ratio.toFixed(1)}x) — hidrolik/mekanik sorun olası`);
     } else if (ratio > 4 && absExt > 5) {
-      sbScore += 25;
+      score += 25;
       reasons.push(`Yavaş açılma: %99'a ${absExt.toFixed(1)}s (oran ${ratio.toFixed(1)}x)`);
     } else if (ratio > 3 && absExt > 4) {
-      sbScore += 12;
+      score += 12;
       reasons.push(`Açılma gecikmesi: oran ${ratio.toFixed(1)}x`);
     }
+    // ratio > 2.5 with low absolute time is NORMAL variation
   }
 
   // ===========================================
   // Signal 3: Absolute extension time to 99%
+  // Only flag when genuinely extreme AND corroborated
+  // Normal: 0.5-5s (varies by aircraft config)
+  // 5-8s: normal for some configs, suspicious for others
+  // >10s: almost always problematic
+  // >15s: definitely a problem
   // ===========================================
   if (record.durationExtTo99 > 15) {
-    sbScore += 35;
+    score += 35;
     reasons.push(`%99 süresi aşırı: ${record.durationExtTo99.toFixed(1)}s`);
   } else if (record.durationExtTo99 > 10) {
-    sbScore += 15;
+    score += 15;
     reasons.push(`%99 süresi yüksek: ${record.durationExtTo99.toFixed(1)}s`);
   }
+  // 5-10s alone is NOT an anomaly — many normal flights show this
 
   // ===========================================
   // Signal 4: Landing distance inversion (50kn > 30kn)
-  // This is a SENSOR / DATA issue, NOT a speedbrake issue.
-  // Score kept at 30 to preserve 86% detection rate,
-  // but tracked separately so dashboard can label it.
+  // Physics: distance to 30kn MUST be > distance to 50kn
+  // If 50kn distance > 30kn distance × 1.05 → sensor fault
+  // This is always a data quality issue, not a speedbrake issue
   // ===========================================
   if (record.landingDist30kn > 0 && record.landingDist50kn > 0) {
     if (record.landingDist50kn > record.landingDist30kn * 1.05) {
-      ldScore += 30;
-      reasons.push(`İniş mesafesi fizik ihlali: 50kn(${record.landingDist50kn.toFixed(0)}m) > 30kn(${record.landingDist30kn.toFixed(0)}m) — sensör/veri hatası [LD]`);
+      score += 30;
+      reasons.push(`İniş mesafesi fizik ihlali: 50kn(${record.landingDist50kn.toFixed(0)}m) > 30kn(${record.landingDist30kn.toFixed(0)}m) — sensör/veri hatası`);
     }
   }
 
   // ===========================================
-  // Signal 5: Angle (PFD Turn 1 Deg) + PFD combination
+  // Signal 5: Angle (PFD Turn 1 Deg)
+  // This is tricky — NG aircraft show TWO operating modes:
+  //   Mode A: ~33-35° (single panel, common)
+  //   Mode B: ~42-47° (full deployment, common)
+  // MAX aircraft: ~46-48° consistently
+  // Doubled records: ~79-80° (two panels summed)
+  //
+  // Only genuinely low angles WITH low PFD matter:
+  //   - <20° with PFD<75% → mechanical failure
+  //   - <25° with PFD<80% → partial blockage
+  //   - 30-35° with PFD 95%+ → just a different operating mode!
+  //
+  // OLD BUG: Flagged 30-35° angles as "düşük" even when PFD was 97%+
   // ===========================================
   if (record.pfdTurn1Deg > 0 && record.pfeTo99Deg > 0) {
     if (record.pfdTurn1Deg < 20 && nPfd < 75) {
-      sbScore += 40;
+      score += 40;
       reasons.push(`Açı çok düşük: ${record.pfdTurn1Deg.toFixed(1)}° + PFD ${nPfd.toFixed(1)}% — mekanik engel olası`);
     } else if (record.pfdTurn1Deg < 25 && nPfd < 80) {
-      sbScore += 25;
+      score += 25;
       reasons.push(`Açı düşük: ${record.pfdTurn1Deg.toFixed(1)}° + PFD ${nPfd.toFixed(1)}%`);
     }
+    // 30-35° with normal PFD (95%+) is NOT an anomaly — it's single-panel mode
+
+    // Delayed opening: initial angle much lower than final angle
+    // Only meaningful if PFD is also below normal
     const degDiff = record.pfeTo99Deg - record.pfdTurn1Deg;
     if (degDiff > 10 && nPfd < 85) {
-      sbScore += 20;
+      score += 20;
       reasons.push(`Gecikmeli açılma: ${record.pfdTurn1Deg.toFixed(1)}° → ${record.pfeTo99Deg.toFixed(1)}° (Δ${degDiff.toFixed(1)}°)`);
     } else if (degDiff > 8 && nPfd < 80) {
-      sbScore += 15;
+      score += 15;
       reasons.push(`Kademeli açılma: ${record.pfdTurn1Deg.toFixed(1)}° → ${record.pfeTo99Deg.toFixed(1)}°`);
     }
   }
 
   // ===========================================
   // Signal 6: Doubled record detection
+  // PFD > 150% means two panels were summed
+  // This is an informational flag, not necessarily an anomaly
   // ===========================================
   if (record.isDoubledRecord) {
+    // Don't add to score — this is a data interpretation issue
     reasons.push(`Çift panel kaydı tespit edildi (ham PFD: ${record.pfdTurn1.toFixed(1)}%)`);
   }
 
   // ===========================================
   // Signal 7: GS at Auto SBOP
+  // Very low values might indicate early deployment
+  // But this heavily depends on flight distance
+  // Only flag truly extreme values
   // ===========================================
   if (record.gsAtAutoSbop > 0 && record.gsAtAutoSbop < 1500) {
-    sbScore += 5;
+    score += 5;
     reasons.push(`GS@SBOP düşük: ${record.gsAtAutoSbop.toFixed(0)} — kısa mesafe veya erken açılma`);
   }
 
   // ===========================================
   // Signal 8: Long landing distance with low PFD
+  // This is the actual safety-relevant combination:
+  // low speedbrake effectiveness → longer stopping distance
   // ===========================================
   if (nPfd < 85 && record.landingDist30kn > 1800) {
-    sbScore += 15;
+    score += 15;
     reasons.push(`Düşük PFD (${nPfd.toFixed(1)}%) + uzun iniş (${record.landingDist30kn.toFixed(0)}m)`);
   }
 
   // ===========================================
-  // TOTAL
+  // FINAL CLASSIFICATION based on accumulated score
+  //
+  // The key insight: a single mildly off-normal parameter
+  // should NOT trigger an alert. Multiple corroborating
+  // signals are needed.
+  //
+  // Score thresholds:
+  //   0-15:  Normal — single mild deviations are expected
+  //   16-39: Warning — multiple signals agree something is off
+  //   40+:   Critical — strong evidence of a real problem
   // ===========================================
-  score = sbScore + ldScore;
-
   let level: 'normal' | 'warning' | 'critical' = 'normal';
-  if (score >= 40) level = 'critical';
-  else if (score >= 16) level = 'warning';
 
-  if (reasons.length === 0) level = 'normal';
-  if (level === 'normal' && reasons.length === 1 && record.isDoubledRecord) level = 'normal';
-
-  // Determine source
-  let source: 'speedbrake' | 'sensor' | 'mixed' | 'none' = 'none';
-  if (level !== 'normal') {
-    const sbAlone = sbScore >= 16;
-    const ldAlone = ldScore >= 16;
-    if (sbAlone && ldAlone) source = 'mixed';
-    else if (sbAlone) source = 'speedbrake';
-    else if (ldAlone) source = 'sensor'; // LD pushed it over the threshold alone
-    else source = 'mixed'; // both contributed but neither alone sufficient
+  if (score >= 40) {
+    level = 'critical';
+  } else if (score >= 16) {
+    level = 'warning';
   }
 
-  return { level, reasons, source };
+  // Clean up: if no reasons accumulated, ensure level stays normal
+  if (reasons.length === 0) {
+    level = 'normal';
+  }
+
+  // For doubled records that otherwise look fine, downgrade to normal
+  if (level === 'normal' && reasons.length === 1 && record.isDoubledRecord) {
+    // Just an informational note, not a real anomaly
+    level = 'normal';
+  }
+
+  return { level, reasons };
 }
 
 // ----------------------------------------------------------------
 // Parse Excel rows → FlightRecord[]
+// Optimized: batch column detection, pre-allocated array
 // ----------------------------------------------------------------
 export function parseExcelData(rows: any[]): FlightRecord[] {
   if (rows.length === 0) return [];
@@ -342,13 +402,12 @@ export function parseExcelData(rows: any[]): FlightRecord[] {
       landingDistAnomaly,
     };
 
-    const { level, reasons, source } = detectAnomaly(partial);
+    const { level, reasons } = detectAnomaly(partial);
 
     records.push({
       ...partial,
       anomalyLevel: level,
       anomalyReasons: reasons,
-      anomalySource: source,
     });
   }
 
@@ -363,7 +422,6 @@ export function computeSummary(data: FlightRecord[]): AnomalySummary {
   if (n === 0) {
     return {
       totalFlights: 0, criticalCount: 0, warningCount: 0, normalCount: 0,
-      sensorOnlyWarningCount: 0,
       uniqueTails: 0, uniqueNGTails: 0, uniqueMAXTails: 0, avgPFD: 0,
       problematicTails: [], avgDeg: 0, avgDuration: 0, avgLandingDist: 0,
       doubledRecords: 0, landingDistAnomalyCount: 0, avgDurationRatio: 0,
@@ -379,7 +437,6 @@ export function computeSummary(data: FlightRecord[]): AnomalySummary {
   let criticalCount = 0;
   let warningCount = 0;
   let normalCount = 0;
-  let sensorOnlyWarningCount = 0;
   let pfdSum = 0;
   let pfdCount = 0;
   let degSum = 0;
@@ -402,10 +459,7 @@ export function computeSummary(data: FlightRecord[]): AnomalySummary {
     else maxTailSet.add(d.tailNumber);
 
     if (d.anomalyLevel === 'critical') { criticalCount++; problematicTailSet.add(d.tailNumber); }
-    else if (d.anomalyLevel === 'warning') {
-      warningCount++;
-      if (d.anomalySource === 'sensor') sensorOnlyWarningCount++;
-    }
+    else if (d.anomalyLevel === 'warning') warningCount++;
     else normalCount++;
 
     if (d.normalizedPfd > 0 && d.normalizedPfd < 105) { pfdSum += d.normalizedPfd; pfdCount++; }
@@ -415,7 +469,9 @@ export function computeSummary(data: FlightRecord[]): AnomalySummary {
     if (d.durationRatio > 0 && d.durationRatio < 50) { drSum += d.durationRatio; drCount++; }
     if (d.isDoubledRecord) doubledRecords++;
     if (d.landingDistAnomaly) landingDistAnomalyCount++;
+    // Slow opening: requires BOTH low PFD AND significant angle difference
     if (d.normalizedPfd < 85 && d.pfeTo99Deg - d.pfdTurn1Deg > 8) slowOpeningCount++;
+    // Mechanical failure: requires BOTH very low PFD AND very low angle
     if (d.normalizedPfd < 70 && d.pfdTurn1Deg < 20) mechanicalFailureCount++;
   }
 
@@ -424,7 +480,6 @@ export function computeSummary(data: FlightRecord[]): AnomalySummary {
     criticalCount,
     warningCount,
     normalCount,
-    sensorOnlyWarningCount,
     uniqueTails: tailSet.size,
     uniqueNGTails: ngTailSet.size,
     uniqueMAXTails: maxTailSet.size,
@@ -442,7 +497,7 @@ export function computeSummary(data: FlightRecord[]): AnomalySummary {
 }
 
 // ----------------------------------------------------------------
-// Filtering
+// Filtering (legacy — non-indexed fallback)
 // ----------------------------------------------------------------
 export function applyFilters(data: FlightRecord[], filters: FilterState): FlightRecord[] {
   let f = data;
@@ -464,7 +519,7 @@ export function applyFilters(data: FlightRecord[], filters: FilterState): Flight
 }
 
 // ----------------------------------------------------------------
-// Pearson correlation
+// Pearson correlation — single pass
 // ----------------------------------------------------------------
 export function computeCorrelation(x: number[], y: number[]): number {
   const n = Math.min(x.length, y.length);
